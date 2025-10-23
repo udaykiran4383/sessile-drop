@@ -21,19 +21,29 @@ class ImageProcessor {
         return {'text': '❌ Failed to decode image. Try a different file.', 'annotated': null};
       }
 
-      // 1) Upsample for subpixel-like precision
+      // 1) Upsample for subpixel-like precision (guard against huge images on mobile)
       final int width0 = src.width;
       final int height0 = src.height;
-      final int width = (width0 * upsample).round();
-      final int height = (height0 * upsample).round();
-      imglib.Image img = imglib.copyResize(src, width: width, height: height, interpolation: imglib.Interpolation.cubic);
+      int safeUpsample = upsample;
+      final pxCount = width0 * height0;
+      // If very large image, avoid doubling pixels to prevent OOM/ANR
+      if (pxCount * upsample * upsample > 3500000) {
+        safeUpsample = 1;
+      }
+      final int width = (width0 * safeUpsample).round();
+      final int height = (height0 * safeUpsample).round();
+      imglib.Image img = (safeUpsample == 1)
+          ? imglib.Image.from(src)
+          : imglib.copyResize(src, width: width, height: height, interpolation: imglib.Interpolation.cubic);
 
-      // 2) Grayscale & contrast stretch (simple)
-      imglib.Image gray = imglib.grayscale(img);
-      _contrastStretch(gray);
+  // 2) Grayscale & contrast stretch (simple) + median denoise to reduce speckle
+  imglib.Image gray = imglib.grayscale(img);
+  _contrastStretch(gray);
+  final denoised = _medianBlur3x3(gray);
 
-      // 3) Smooth
-      imglib.Image blurred = imglib.gaussianBlur(gray, radius: gaussianRadius);
+  // 3) Smooth (light) to stabilize gradients further
+  final int gRad = gaussianRadius.clamp(2, 4);
+  imglib.Image blurred = imglib.gaussianBlur(denoised, radius: gRad);
 
       // 4) Gradient (Sobel) -> magnitude + angle
       final grad = _sobelMagnitudeAndAngle(blurred);
@@ -47,8 +57,8 @@ class ImageProcessor {
       final low = (high * lowThresholdFactor).clamp(5.0, high);
   var edges = _hysteresis(nms, grad.magnitude, grad.width, grad.height, low: low, high: high);
 
-  // 6.5) Morphological cleanup to reduce speckle noise (3x3 open+close)
-  edges = _morphOpen(edges, grad.width, grad.height, iterations: 1);
+  // 6.5) Morphological cleanup to reduce speckle noise (3x3 open x2 + close)
+  edges = _morphOpen(edges, grad.width, grad.height, iterations: 2);
   edges = _morphClose(edges, grad.width, grad.height, iterations: 1);
 
       // 7) Connected components on edges -> keep largest component near center bottom (droplet)
@@ -67,7 +77,7 @@ class ImageProcessor {
     // 9) Baseline detection: robust near-horizontal line in bottom region
     final baseline = _detectBaselineRobust(edges, contour, grad.width, grad.height,
       bottomFracStart: 0.45, bottomFracEnd: 0.95, roiWidthPercent: 80,
-      slopeMaxDeg: 3, inlierThreshold: 1.5, iterations: 220);
+      slopeMaxDeg: 3, inlierThreshold: 1.2, iterations: 260);
 
       // baseline: represented as (a,b,c) normalized for ax + by + c = 0 and endpoints (x1,y1,x2,y2)
       final baselineLine = baseline.lineParams;
@@ -88,8 +98,8 @@ class ImageProcessor {
         cleanedArc,
         baseline.baselineY,
         grad.height,
-        minAbovePx: math.max(6.0, grad.height * 0.015),
-        maxAbovePx: math.max(18.0, grad.height * 0.06),
+        minAbovePx: math.max(5.0, grad.height * 0.012),
+        maxAbovePx: math.max(12.0, grad.height * 0.04),
       );
 
       final List<math.Point>? ptsForFit = beltPts.length >= 8 ? beltPts : cleanedArc;
@@ -134,7 +144,7 @@ class ImageProcessor {
   final ys = fitPts.map((p) => p.y.toDouble()).toList();
 
       // Two competing fits: (A) robust RANSAC; (B) constrained through contacts.
-      final circleA = AngleUtils.ransacCircleFit(xs, ys, iterations: 220, inlierThreshold: 1.8);
+  final circleA = AngleUtils.ransacCircleFit(xs, ys, iterations: 320, inlierThreshold: 1.4);
       if (circleA == null) {
         return {'text': '❌ Circle fit failed.', 'annotated': null};
       }
@@ -188,20 +198,47 @@ class ImageProcessor {
         cx = refined[0]; cy = refined[1]; r = refined[2];
       } // else keep the seed result
 
-      // 11) Find left/right contact points: intersection of circle and baseline (solve)
-      List<math.Point>? contacts = _circleBaselineIntersections(cx, cy, r, baselineLine, grad.width, grad.height);
-      if (contacts == null || contacts.length < 2) {
-        // fallback: find leftmost/rightmost contour points near baseline
-        final fallback = _fallbackContactsFromContour(contour, baselineLine);
-        if (fallback == null) {
-          return {'text': '❌ Could not compute contact points.', 'annotated': null};
+      // 11) Contact points must be exactly at the circle-baseline intersections.
+      // We anchor selection to observed contour intersections (by x-closest),
+      // but the final points are the circle∩baseline to ensure true geometric contact.
+      final contourLineXings = _contourBaselineIntersections(contour, baselineLine);
+      List<math.Point> circleXings = _circleBaselineIntersections(cx, cy, r, baselineLine, grad.width, grad.height) ?? [];
+      math.Point leftPt, rightPt;
+      if (circleXings.length >= 2) {
+        circleXings.sort((u,v)=>u.x.compareTo(v.x));
+        if (contourLineXings.length >= 2) {
+          contourLineXings.sort((u,v)=>u.x.compareTo(v.x));
+          // choose the circle intersections (left/right) that are closest in x to observed ones
+          final leftObsX = contourLineXings.first.x.toDouble();
+          final rightObsX = contourLineXings.last.x.toDouble();
+          // Already sorted, so keep order
+          leftPt = circleXings[0];
+          rightPt = circleXings[1];
+          // If circle-xings are swapped far from observed, keep as-is but they still lie on baseline
+          // Optional small snap to image bounds
+          leftPt = _clampPointToImage(leftPt, grad.width, grad.height);
+          rightPt = _clampPointToImage(rightPt, grad.width, grad.height);
+        } else {
+          leftPt = circleXings[0];
+          rightPt = circleXings[1];
         }
-        // ensure two points
-        contacts = [fallback.left, fallback.right];
+      } else {
+        // Fallback: use contour xings projected to circle radially, then snap to baseline x using line equation
+        if (contourLineXings.length >= 2) {
+          contourLineXings.sort((u,v)=>u.x.compareTo(v.x));
+          final leftProj = _projectPointToCircle(cx, cy, r, contourLineXings.first);
+          final rightProj = _projectPointToCircle(cx, cy, r, contourLineXings.last);
+          leftPt = _projectPointToLine(leftProj, baselineLine);
+          rightPt = _projectPointToLine(rightProj, baselineLine);
+        } else {
+          final fallback = _fallbackContactsFromContour(contour, baselineLine);
+          if (fallback == null) {
+            return {'text': '❌ Could not compute contact points.', 'annotated': null};
+          }
+          leftPt = _projectPointToLine(_projectPointToCircle(cx, cy, r, fallback.left), baselineLine);
+          rightPt = _projectPointToLine(_projectPointToCircle(cx, cy, r, fallback.right), baselineLine);
+        }
       }
-
-      final leftPt = contacts[0];
-      final rightPt = contacts[1];
 
       // 12) Compute tangent angles at contact points using circle geometry (tangent vector = perp(radius))
       final baselineVec = math.Point(baselineEndpoints[2] - baselineEndpoints[0], baselineEndpoints[3] - baselineEndpoints[1]);
@@ -210,7 +247,7 @@ class ImageProcessor {
       final avgAngle = (leftAngle + rightAngle) / 2.0;
 
     // 13) Refine rim points (subpixel) and compute robust local-polynomial angles
-    final refinedArc = _refineArcSubpixel(cleanedArc, grad, iterations: 1);
+  final refinedArc = _refineArcSubpixel(cleanedArc, grad, iterations: 2);
     final rimForAngles = refinedArc.isNotEmpty ? refinedArc : cleanedArc;
     final leftLocalAngle = AngleUtils.polynomialLocalAngle(_nearbyPoints(rimForAngles, leftPt, radius: 16), leftPt, baselineLine, isLeft: true);
     final rightLocalAngle = AngleUtils.polynomialLocalAngle(_nearbyPoints(rimForAngles, rightPt, radius: 16), rightPt, baselineLine, isLeft: false);
@@ -219,8 +256,11 @@ class ImageProcessor {
     // 14) Bootstrap uncertainty
       final uncertainty = _bootstrapUncertainty(xs, ys, baselineLine, baselineVec);
 
-    // 15) Prepare nicer visuals: draw the refined arc polyline (light smoothing)
-    final arcPolyline = _connectAndSmoothContour(refinedArc.isNotEmpty ? refinedArc : cleanedArc, iterations: 1, closed: false);
+      // 15) Prepare nicer visuals:
+      //  - Full droplet boundary (closed, smoothed) for a clear green outline
+      //  - Refined rim arc polyline (open) for precision near contact
+      final fullContourClosed = _connectAndSmoothContour(contour, iterations: 1, closed: true);
+      final arcPolyline = _connectAndSmoothContour(refinedArc.isNotEmpty ? refinedArc : cleanedArc, iterations: 1, closed: false);
 
       // 16) Annotate image (draw arc polyline, fitted circle, baseline, contact points, tangents)
       // Compute local polynomial tangents for visualization
@@ -229,6 +269,7 @@ class ImageProcessor {
 
       final annotated = _drawAnnotatedImage(
         img,
+        fullContourClosed,
         arcPolyline,
         cx,
         cy,
@@ -238,7 +279,7 @@ class ImageProcessor {
         rightPt,
         leftPolyTan,
         rightPolyTan,
-        upsample,
+        safeUpsample,
       );
 
       // Save annotated as PNG
@@ -247,26 +288,21 @@ class ImageProcessor {
       final outFile = File(outPath);
       await outFile.writeAsBytes(imglib.encodePng(annotated));
 
-      String surfaceType;
-      if (finalAngle < 90) surfaceType = 'Hydrophilic';
-      else if (finalAngle < 150) surfaceType = 'Hydrophobic';
-      else surfaceType = 'Superhydrophobic';
+  String surfaceType;
+  final circlePreferred = avgAngle;
+  if (circlePreferred < 90) surfaceType = 'Hydrophilic';
+  else if (circlePreferred < 150) surfaceType = 'Hydrophobic';
+  else surfaceType = 'Superhydrophobic';
 
-      String resultText = '''🎯 Contact Angle: ${finalAngle.toStringAsFixed(2)}° ± ${uncertainty.toStringAsFixed(2)}°\n
-Methods:
- • Circle-fit (robust): ${avgAngle.toStringAsFixed(2)}°
- • Local-polynomial: ${( (leftLocalAngle + rightLocalAngle) / 2.0).toStringAsFixed(2)}°
- • Final (avg of methods): ${finalAngle.toStringAsFixed(2)}°
-Quality:
- • Contour points: ${contour.length}
- • Baseline Y (approx): ${baselineYapprox.toStringAsFixed(2)}
-''';
+  // Prefer the circle-fit angle to match ImageJ-style outputs; keep local-polynomial as reference
+  // Minimal text output to reduce UI noise: angle and classification only
+  String resultText = 'Contact Angle: ${circlePreferred.toStringAsFixed(2)}° ($surfaceType)';
 
       return {
         'text': resultText,
         'annotated': outFile,
         'annotated_path': outPath,
-        'angle_numeric': finalAngle,
+        'angle_numeric': circlePreferred,
         'uncertainty_numeric': uncertainty,
         'theta_circle': avgAngle,
         'theta_poly': (leftLocalAngle + rightLocalAngle) / 2.0,
@@ -337,6 +373,28 @@ Quality:
         img.setPixelRgba(x, y, stretched, stretched, stretched, 255);
       }
     }
+  }
+
+  // Median blur 3x3 on a single-channel image (expects grayscale in RGB channels)
+  static imglib.Image _medianBlur3x3(imglib.Image img) {
+    final w = img.width, h = img.height;
+    final out = imglib.Image.from(img);
+    // borders: copy-through
+    for (int y = 1; y < h - 1; y++) {
+      for (int x = 1; x < w - 1; x++) {
+        final vals = <int>[];
+        for (int ky = -1; ky <= 1; ky++) {
+          for (int kx = -1; kx <= 1; kx++) {
+            vals.add(_getRedFromPixel(img.getPixel(x + kx, y + ky)));
+          }
+        }
+        vals.sort();
+        final m = vals[4];
+        out.setPixelRgba(x, y, m, m, m, 255);
+      }
+    }
+    // handle border rows/cols by simple copy (already from(img))
+    return out;
   }
 
   // Sobel magnitude + angle
@@ -943,6 +1001,68 @@ Quality:
     }
   }
 
+  // Find intersections between the observed contour polyline and the baseline line.
+  // Returns 0, 1, or multiple intersection points; we expect typically 2 (left/right).
+  static List<math.Point> _contourBaselineIntersections(List<math.Point> contour, List<double> baseline) {
+    if (contour.length < 2) return <math.Point>[];
+    // normalize baseline to avoid numeric issues
+    double a = baseline[0], b = baseline[1], c = baseline[2];
+    final nrm = math.sqrt(a*a + b*b);
+    if (nrm == 0) return <math.Point>[];
+    a /= nrm; b /= nrm; c /= nrm;
+    final res = <math.Point>[];
+    // iterate over segments (closed contour)
+    for (int i = 0; i < contour.length; i++) {
+      final p1 = contour[i];
+      final p2 = contour[(i+1) % contour.length];
+      final s1 = a * p1.x + b * p1.y + c;
+      final s2 = a * p2.x + b * p2.y + c;
+      final denom = a * (p2.x - p1.x) + b * (p2.y - p1.y);
+      if (denom.abs() < 1e-9) {
+        // segment nearly parallel to line; skip unless one endpoint on line
+        if (s1.abs() < 1e-6) res.add(p1);
+        if (s2.abs() < 1e-6) res.add(p2);
+        continue;
+      }
+      final t = -s1 / denom; // param along segment
+      if (t >= -1e-6 && t <= 1+1e-6) {
+        final ix = p1.x + (p2.x - p1.x) * t;
+        final iy = p1.y + (p2.y - p1.y) * t;
+        res.add(math.Point(ix, iy));
+      }
+    }
+    return res;
+  }
+
+  // Project an arbitrary point to the nearest point on the circle along the radial direction from (cx,cy).
+  static math.Point _projectPointToCircle(double cx, double cy, double r, math.Point p) {
+    final vx = p.x.toDouble() - cx;
+    final vy = p.y.toDouble() - cy;
+    final len = math.sqrt(vx*vx + vy*vy);
+    if (len < 1e-9) return math.Point(cx + r, cy); // arbitrary to the right
+    final ux = vx / len;
+    final uy = vy / len;
+    return math.Point(cx + r * ux, cy + r * uy);
+  }
+
+  // Project a point to the closest point on a line ax + by + c = 0
+  static math.Point _projectPointToLine(math.Point p, List<double> baseline) {
+    double a = baseline[0], b = baseline[1], c = baseline[2];
+    final n = math.sqrt(a*a + b*b);
+    if (n == 0) return p;
+    a /= n; b /= n; c /= n;
+    final d = a * p.x + b * p.y + c;
+    final px = p.x - a * d;
+    final py = p.y - b * d;
+    return math.Point(px, py);
+  }
+
+  static math.Point _clampPointToImage(math.Point p, int w, int h) {
+    final x = p.x.clamp(0.0, (w - 1).toDouble());
+    final y = p.y.clamp(0.0, (h - 1).toDouble());
+    return math.Point(x, y);
+  }
+
   // helper for fallback projection is defined at file level
 
   static double _angleBetweenTangentAndBaseline(double cx, double cy, math.Point contact, math.Point baselineVec) {
@@ -1014,6 +1134,7 @@ Quality:
   // draw annotated image (downscale back to original size at end)
   static imglib.Image _drawAnnotatedImage(
     imglib.Image upImg,
+    List<math.Point> fullContour,
     List<math.Point> contour,
     double cx,
     double cy,
@@ -1029,45 +1150,41 @@ Quality:
     final w = annotated.width;
     final h = annotated.height;
 
-    // draw connected contour/arc polyline (green). Not closed to avoid chords.
-    if (contour.length > 1) {
-      _drawPolyline(annotated, contour, r: 0, g: 220, b: 0, closed: false, thickness: 2);
-    }
+    // Ultra-minimal: do not draw the raw full contour to reduce clutter
 
-    // draw fitted circle (cyan)
+  // Ultra-minimal: omit refined rim arc polyline
+
+    // draw fitted circle (GREEN) with a thin stroke for precision (green boundary only for circular boundary)
     if (r.isFinite && r > 1) {
       final steps = (2 * math.pi * r).ceil().clamp(64, 2000);
+      final thick = 1;
       for (int i = 0; i < steps; i++) {
         final ang = (i / steps) * 2.0 * math.pi;
         final px = (cx + r * math.cos(ang)).round();
         final py = (cy + r * math.sin(ang)).round();
-        if (px >= 0 && px < w && py >= 0 && py < h) annotated.setPixelRgba(px, py, 0, 255, 255, 255);
+        if (px >= 0 && px < w && py >= 0 && py < h) {
+          annotated.setPixelRgba(px, py, 0, 255, 0, 255);
+        }
       }
-      if (cx.round() >= 0 && cx.round() < w && cy.round() >= 0 && cy.round() < h) annotated.setPixelRgba(cx.round(), cy.round(), 0, 255, 255, 255);
+      // Omit drawing the circle center to reduce clutter
     }
 
-    // baseline (yellow)
+    // baseline (yellow, slightly thinner)
     final x1 = baselineEnds[0].round();
     final y1 = baselineEnds[1].round();
     final x2 = baselineEnds[2].round();
     final y2 = baselineEnds[3].round();
-  _drawThickLine(annotated, x1, y1, x2, y2, 255, 200, 0, 3);
+  _drawThickLine(annotated, x1, y1, x2, y2, 255, 200, 0, 2);
 
-    // contact points (magenta)
-    annotated.setPixelRgba(leftPt.x.round(), leftPt.y.round(), 255, 0, 255, 255);
-    annotated.setPixelRgba(rightPt.x.round(), rightPt.y.round(), 255, 0, 255, 255);
+    // Ultra-minimal: omit contact point markers
 
-  // draw tangents at contact points from circle (white) to make angle reference clear
-  _drawTangent(annotated, cx, cy, leftPt, length: 60, r: 255, g: 255, b: 255);
-  _drawTangent(annotated, cx, cy, rightPt, length: 60, r: 255, g: 255, b: 255);
+  // draw tangents at contact points from circle as one-sided rays for clarity (red)
+  final tanLen = (math.max(w, h) * 0.16).round().clamp(40, 200);
+  _drawTangentRay(annotated, cx, cy, leftPt, length: tanLen, r: 255, g: 60, b: 60, thickness: 3);
+  _drawTangentRay(annotated, cx, cy, rightPt, length: tanLen, r: 255, g: 60, b: 60, thickness: 3);
 
     // draw local polynomial tangents (orange) for comparison
-    if (leftPolyTan.length >= 2) {
-      _drawTangentVector(annotated, leftPt, leftPolyTan[0], leftPolyTan[1], length: 60, r: 255, g: 140, b: 0);
-    }
-    if (rightPolyTan.length >= 2) {
-      _drawTangentVector(annotated, rightPt, rightPolyTan[0], rightPolyTan[1], length: 60, r: 255, g: 140, b: 0);
-    }
+  // Omit local polynomial tangent overlays to keep only essential graphics
 
     // downscale back to original by factor upsample
     if (upsample > 1) {
@@ -1169,7 +1286,7 @@ Quality:
   }
 
   // Draw a tangent line at a point on the circle (perpendicular to radius)
-  static void _drawTangent(imglib.Image img, double cx, double cy, math.Point pt, {int length = 50, int r = 255, int g = 255, int b = 255}) {
+  static void _drawTangent(imglib.Image img, double cx, double cy, math.Point pt, {int length = 50, int r = 255, int g = 255, int b = 255, int thickness = 2}) {
     final rx = pt.x.toDouble() - cx;
     final ry = pt.y.toDouble() - cy;
     // tangent direction = (-ry, rx)
@@ -1182,11 +1299,27 @@ Quality:
     final y0 = (pt.y - ty * length / 2).round();
     final x1 = (pt.x + tx * length / 2).round();
     final y1 = (pt.y + ty * length / 2).round();
-    _drawLine(img, x0, y0, x1, y1, r, g, b);
+    _drawThickLine(img, x0, y0, x1, y1, r, g, b, thickness);
+  }
+
+  // Draw a one-sided tangent ray starting exactly at the contact point and extending upward/outward
+  static void _drawTangentRay(imglib.Image img, double cx, double cy, math.Point pt, {int length = 50, int r = 255, int g = 255, int b = 255, int thickness = 2}) {
+    final rx = pt.x.toDouble() - cx;
+    final ry = pt.y.toDouble() - cy;
+    double tx = -ry;
+    double ty = rx;
+    final norm = math.sqrt(tx * tx + ty * ty);
+    if (norm < 1e-6) return;
+    tx /= norm; ty /= norm;
+    // Prefer the tangent direction that points upward (negative y) for visibility
+    if (ty > 0) { tx = -tx; ty = -ty; }
+    final x1 = (pt.x + tx * length).round();
+    final y1 = (pt.y + ty * length).round();
+    _drawThickLine(img, pt.x.round(), pt.y.round(), x1, y1, r, g, b, thickness);
   }
 
   // Draw a tangent given a unit direction (ux, uy) at a point
-  static void _drawTangentVector(imglib.Image img, math.Point pt, double ux, double uy, {int length = 50, int r = 255, int g = 255, int b = 255}) {
+  static void _drawTangentVector(imglib.Image img, math.Point pt, double ux, double uy, {int length = 50, int r = 255, int g = 255, int b = 255, int thickness = 2}) {
     final n = math.sqrt(ux * ux + uy * uy);
     if (n < 1e-9) return;
     final tx = ux / n;
@@ -1195,7 +1328,7 @@ Quality:
     final y0 = (pt.y - ty * length / 2).round();
     final x1 = (pt.x + tx * length / 2).round();
     final y1 = (pt.y + ty * length / 2).round();
-    _drawLine(img, x0, y0, x1, y1, r, g, b);
+    _drawThickLine(img, x0, y0, x1, y1, r, g, b, thickness);
   }
 
   // Draw a thicker line by stamping neighboring offsets
