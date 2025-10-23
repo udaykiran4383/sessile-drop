@@ -432,7 +432,7 @@ class _HomePageState extends State<HomePage> {
                   ),
                   SizedBox(height: 8),
                   Text(
-                    'Green: Droplet boundary | Red: Baseline | Purple: Contact points & fit',
+                    'Green: Droplet rim | Yellow: Baseline | Cyan: Fitted circle | Magenta: Contact points | White: Tangents',
                     style: TextStyle(
                       fontSize: 12,
                       color: Colors.grey[500],
