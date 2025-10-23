@@ -209,19 +209,24 @@ class ImageProcessor {
       final rightAngle = _angleBetweenTangentAndBaseline(cx, cy, rightPt, baselineVec);
       final avgAngle = (leftAngle + rightAngle) / 2.0;
 
-      // 13) Compute polynomial local-fit angles as a sanity/fallback and average
-      final leftLocalAngle = AngleUtils.polynomialLocalAngle(_nearbyPoints(contour, leftPt, radius: 12), leftPt, baselineLine, isLeft: true);
-      final rightLocalAngle = AngleUtils.polynomialLocalAngle(_nearbyPoints(contour, rightPt, radius: 12), rightPt, baselineLine, isLeft: false);
+    // 13) Refine rim points (subpixel) and compute robust local-polynomial angles
+    final refinedArc = _refineArcSubpixel(cleanedArc, grad, iterations: 1);
+    final rimForAngles = refinedArc.isNotEmpty ? refinedArc : cleanedArc;
+    final leftLocalAngle = AngleUtils.polynomialLocalAngle(_nearbyPoints(rimForAngles, leftPt, radius: 16), leftPt, baselineLine, isLeft: true);
+    final rightLocalAngle = AngleUtils.polynomialLocalAngle(_nearbyPoints(rimForAngles, rightPt, radius: 16), rightPt, baselineLine, isLeft: false);
+    final finalAngle = (avgAngle + (leftLocalAngle + rightLocalAngle) / 2.0) / 2.0;
 
-      final finalAngle = (avgAngle + (leftLocalAngle + rightLocalAngle) / 2.0) / 2.0;
-
-      // 14) Bootstrap uncertainty
+    // 14) Bootstrap uncertainty
       final uncertainty = _bootstrapUncertainty(xs, ys, baselineLine, baselineVec);
 
-      // 15) Prepare nicer visuals: use only the cleaned arc points to draw boundary
-  final arcPolyline = _connectAndSmoothContour(cleanedArc, iterations: 1, closed: false);
+    // 15) Prepare nicer visuals: draw the refined arc polyline (light smoothing)
+    final arcPolyline = _connectAndSmoothContour(refinedArc.isNotEmpty ? refinedArc : cleanedArc, iterations: 1, closed: false);
 
       // 16) Annotate image (draw arc polyline, fitted circle, baseline, contact points, tangents)
+      // Compute local polynomial tangents for visualization
+      final leftPolyTan = AngleUtils.polynomialLocalTangent(_nearbyPoints(rimForAngles, leftPt, radius: 16), leftPt);
+      final rightPolyTan = AngleUtils.polynomialLocalTangent(_nearbyPoints(rimForAngles, rightPt, radius: 16), rightPt);
+
       final annotated = _drawAnnotatedImage(
         img,
         arcPolyline,
@@ -231,6 +236,8 @@ class ImageProcessor {
         baselineEndpoints,
         leftPt,
         rightPt,
+        leftPolyTan,
+        rightPolyTan,
         upsample,
       );
 
@@ -1014,6 +1021,8 @@ Quality:
     List<double> baselineEnds,
     math.Point leftPt,
     math.Point rightPt,
+    List<double> leftPolyTan,
+    List<double> rightPolyTan,
     int upsample,
   ) {
     final annotated = imglib.Image.from(upImg);
@@ -1048,9 +1057,17 @@ Quality:
     annotated.setPixelRgba(leftPt.x.round(), leftPt.y.round(), 255, 0, 255, 255);
     annotated.setPixelRgba(rightPt.x.round(), rightPt.y.round(), 255, 0, 255, 255);
 
-  // draw tangents at contact points (white) to make angle reference clear
+  // draw tangents at contact points from circle (white) to make angle reference clear
   _drawTangent(annotated, cx, cy, leftPt, length: 60, r: 255, g: 255, b: 255);
   _drawTangent(annotated, cx, cy, rightPt, length: 60, r: 255, g: 255, b: 255);
+
+    // draw local polynomial tangents (orange) for comparison
+    if (leftPolyTan.length >= 2) {
+      _drawTangentVector(annotated, leftPt, leftPolyTan[0], leftPolyTan[1], length: 60, r: 255, g: 140, b: 0);
+    }
+    if (rightPolyTan.length >= 2) {
+      _drawTangentVector(annotated, rightPt, rightPolyTan[0], rightPolyTan[1], length: 60, r: 255, g: 140, b: 0);
+    }
 
     // downscale back to original by factor upsample
     if (upsample > 1) {
@@ -1168,6 +1185,19 @@ Quality:
     _drawLine(img, x0, y0, x1, y1, r, g, b);
   }
 
+  // Draw a tangent given a unit direction (ux, uy) at a point
+  static void _drawTangentVector(imglib.Image img, math.Point pt, double ux, double uy, {int length = 50, int r = 255, int g = 255, int b = 255}) {
+    final n = math.sqrt(ux * ux + uy * uy);
+    if (n < 1e-9) return;
+    final tx = ux / n;
+    final ty = uy / n;
+    final x0 = (pt.x - tx * length / 2).round();
+    final y0 = (pt.y - ty * length / 2).round();
+    final x1 = (pt.x + tx * length / 2).round();
+    final y1 = (pt.y + ty * length / 2).round();
+    _drawLine(img, x0, y0, x1, y1, r, g, b);
+  }
+
   // Draw a thicker line by stamping neighboring offsets
   static void _drawThickLine(imglib.Image img, int x0, int y0, int x1, int y1, int r, int g, int b, int thickness) {
     final t = thickness.clamp(1, 7);
@@ -1212,6 +1242,54 @@ Quality:
       current = next;
     }
     return current;
+  }
+
+  // --- Subpixel rim refinement using gradient magnitude ridge alignment ---
+  static List<math.Point> _refineArcSubpixel(List<math.Point> pts, _GradResult grad, {int iterations = 1}) {
+    if (pts.isEmpty) return pts;
+    final w = grad.width, h = grad.height;
+    List<math.Point> cur = pts;
+    for (int it = 0; it < iterations; it++) {
+      final next = <math.Point>[];
+      for (final p in cur) {
+        final xi = p.x.clamp(1.0, (w - 2).toDouble()).toDouble();
+        final yi = p.y.clamp(1.0, (h - 2).toDouble()).toDouble();
+        final ang = grad.angle[yi.round() * w + xi.round()];
+        final ux = math.cos(ang);
+        final uy = math.sin(ang);
+        // sample magnitude at p - u, p, p + u
+        final m1 = _bilinearSample(grad.magnitude, w, h, xi - ux, yi - uy);
+        final m2 = _bilinearSample(grad.magnitude, w, h, xi, yi);
+        final m3 = _bilinearSample(grad.magnitude, w, h, xi + ux, yi + uy);
+        final denom = (m1 - 2*m2 + m3);
+        double delta = 0.0;
+        if (denom.abs() > 1e-6) delta = 0.5 * (m1 - m3) / denom; // vertex of parabola
+        delta = delta.clamp(-0.8, 0.8);
+        final nx = xi + ux * delta;
+        final ny = yi + uy * delta;
+        next.add(math.Point(nx, ny));
+      }
+      cur = next;
+    }
+    return cur;
+  }
+
+  static double _bilinearSample(List<double> img, int w, int h, double x, double y) {
+    x = x.clamp(0.0, (w - 1).toDouble()).toDouble();
+    y = y.clamp(0.0, (h - 1).toDouble()).toDouble();
+    final x0 = x.floor();
+    final y0 = y.floor();
+    final int x1 = math.min(x0 + 1, w - 1);
+    final int y1 = math.min(y0 + 1, h - 1);
+    final fx = x - x0;
+    final fy = y - y0;
+    double v00 = img[y0 * w + x0];
+    double v10 = img[y0 * w + x1];
+    double v01 = img[y1 * w + x0];
+    double v11 = img[y1 * w + x1];
+    final v0 = v00 * (1 - fx) + v10 * fx;
+    final v1 = v01 * (1 - fx) + v11 * fx;
+    return v0 * (1 - fy) + v1 * fy;
   }
 
   /// Select a narrow vertical belt of rim points just above the baseline.

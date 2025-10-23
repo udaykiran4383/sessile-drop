@@ -107,37 +107,152 @@ class AngleUtils {
   }
 
   /// Local polynomial fit around contact for tangent computation
-  static double polynomialLocalAngle(List<math.Point> points, math.Point contact, List<double> baselineLine, {required bool isLeft}) {
+  /// Uses a robust, weighted quadratic regression centered at the contact
+  /// to estimate the local slope with good numerical stability.
+  static double polynomialLocalAngle(
+    List<math.Point> points,
+    math.Point contact,
+    List<double> baselineLine, {
+    required bool isLeft,
+  }) {
     if (points.isEmpty) return 90.0;
     final xs = points.map((p) => p.x.toDouble()).toList();
     final ys = points.map((p) => p.y.toDouble()).toList();
 
-    final dx = (xs.reduce((a,b) => math.max(a,b)) - xs.reduce((a,b) => math.min(a,b))).abs();
-    final dy = (ys.reduce((a,b) => math.max(a,b)) - ys.reduce((a,b) => math.min(a,b))).abs();
-    final fitXasFuncOfY = dy > 1.5 * dx;
+    // Decide whether to fit y(x) or x(y) based on local aspect ratio
+    final minX = xs.reduce(math.min), maxX = xs.reduce(math.max);
+    final minY = ys.reduce(math.min), maxY = ys.reduce(math.max);
+    final dx = (maxX - minX).abs();
+    final dy = (maxY - minY).abs();
+    final fitXasFuncOfY = dy > 1.5 * dx; // steep -> fit x(y)
 
-    List<double> coeffs;
-    try {
-      if (fitXasFuncOfY) {
-        coeffs = _polyfit(ys, xs, 3);
-      } else {
-        coeffs = _polyfit(xs, ys, 3);
+    // Independent variable t, dependent z
+    final t = fitXasFuncOfY ? ys : xs;
+    final z = fitXasFuncOfY ? xs : ys;
+
+    // Center and scale t around contact for better conditioning
+    final t0 = fitXasFuncOfY ? contact.y.toDouble() : contact.x.toDouble();
+    final rangeT = (t.reduce(math.max) - t.reduce(math.min)).abs();
+    final dtAbs = t.map((v) => (v - t0).abs()).toList();
+    dtAbs.sort();
+    final p75 = dtAbs.isEmpty ? 1.0 : dtAbs[(dtAbs.length * 3 ~/ 4).clamp(0, dtAbs.length - 1)];
+    final scale = math.max(2.5, math.max(0.5 * rangeT, p75));
+
+    // Initial Gaussian weights favoring points nearest t0
+    final sigma = math.max(2.5, 0.4 * rangeT);
+    final w = List<double>.generate(t.length, (i) {
+      final u = (t[i] - t0) / sigma;
+      return math.exp(-0.5 * u * u);
+    });
+
+    // IRLS with Tukey biweight to resist outliers
+    List<double> coeffs = _polyfitWeightedCentered(t, z, degree: 2, w: w, center: t0, scale: scale);
+    for (int it = 0; it < 2; it++) {
+      // Predict and compute residuals
+      final preds = List<double>.generate(t.length, (i) {
+        final u = (t[i] - t0) / scale;
+        return coeffs[0] + coeffs[1] * u + coeffs[2] * u * u;
+      });
+      final res = List<double>.generate(t.length, (i) => z[i] - preds[i]);
+      final absRes = res.map((e) => e.abs()).toList()..sort();
+      final mad = absRes.isEmpty ? 1.0 : absRes[absRes.length ~/ 2];
+      final s = math.max(1e-3, 1.4826 * mad);
+      const c = 4.685; // Tukey constant
+      for (int i = 0; i < w.length; i++) {
+        final r = res[i] / s;
+        if (r.abs() <= c) {
+          final t1 = 1.0 - (r * r) / (c * c);
+          w[i] = w[i] * t1 * t1; // combine with Gaussian proximity weight
+        } else {
+          w[i] = 0.0;
+        }
       }
-    } catch (e) {
-      return 90.0;
+      coeffs = _polyfitWeightedCentered(t, z, degree: 2, w: w, center: t0, scale: scale);
     }
 
-    double independent = fitXasFuncOfY ? contact.y.toDouble() : contact.x.toDouble();
-    final b = coeffs.length > 1 ? coeffs[1] : 0.0;
-    final c = coeffs.length > 2 ? coeffs[2] : 0.0;
-    final d = coeffs.length > 3 ? coeffs[3] : 0.0;
-    final slope = b + 2.0 * c * independent + 3.0 * d * independent * independent;
-    double dy_dx = fitXasFuncOfY ? 1.0 / (slope + 1e-9) : slope;
-    final angleRad = math.atan(dy_dx.abs());
-    final angleDeg = angleRad * 180.0 / math.pi;
-    bool isInterior = (isLeft && dy_dx > 0) || (!isLeft && dy_dx < 0);
-    final finalAngle = isInterior ? angleDeg : 180.0 - angleDeg;
-    return finalAngle.clamp(0.0, 180.0);
+    // Slope at contact in original coordinates.
+    // If model is z(u) with u=(t-t0)/scale, then dz/dt at t0 is coeffs[1]/scale.
+    final slope_t2z = coeffs[1] / scale;
+    // Convert to dy/dx
+    double dy_dx = fitXasFuncOfY ? 1.0 / (slope_t2z.abs() < 1e-9 ? 1e-9 : slope_t2z) : slope_t2z;
+
+    // Build tangent direction from slope (dy/dx)
+    final tx = 1.0;
+    final ty = dy_dx;
+    final tv = math.sqrt(tx * tx + ty * ty);
+    final ux = tx / (tv == 0 ? 1.0 : tv);
+    final uy = ty / (tv == 0 ? 1.0 : tv);
+
+    // Baseline direction from line endpoints [x0,y0,x1,y1]
+    double angleDeg;
+    if (baselineLine.length >= 4) {
+      final bx = baselineLine[2] - baselineLine[0];
+      final by = baselineLine[3] - baselineLine[1];
+      final bl = math.sqrt(bx * bx + by * by);
+      if (bl > 1e-9) {
+        final bnx = bx / bl, bny = by / bl;
+        final dot = (ux * bnx + uy * bny).clamp(-1.0, 1.0);
+        angleDeg = math.acos(dot.abs()) * 180.0 / math.pi; // acute angle
+      } else {
+        angleDeg = math.atan(dy_dx.abs()) * 180.0 / math.pi;
+      }
+    } else {
+      angleDeg = math.atan(dy_dx.abs()) * 180.0 / math.pi;
+    }
+
+    return angleDeg.clamp(0.0, 180.0);
+  }
+
+  /// Returns the unit tangent vector [ux, uy] at the contact using the same
+  /// robust local quadratic fit as polynomialLocalAngle.
+  static List<double> polynomialLocalTangent(List<math.Point> points, math.Point contact) {
+    if (points.isEmpty) return [1.0, 0.0];
+    final xs = points.map((p) => p.x.toDouble()).toList();
+    final ys = points.map((p) => p.y.toDouble()).toList();
+    final minX = xs.reduce(math.min), maxX = xs.reduce(math.max);
+    final minY = ys.reduce(math.min), maxY = ys.reduce(math.max);
+    final dx = (maxX - minX).abs();
+    final dy = (maxY - minY).abs();
+    final fitXasFuncOfY = dy > 1.5 * dx;
+    final t = fitXasFuncOfY ? ys : xs;
+    final z = fitXasFuncOfY ? xs : ys;
+    final t0 = fitXasFuncOfY ? contact.y.toDouble() : contact.x.toDouble();
+    final rangeT = (t.reduce(math.max) - t.reduce(math.min)).abs();
+    final dtAbs = t.map((v) => (v - t0).abs()).toList()..sort();
+    final p75 = dtAbs.isEmpty ? 1.0 : dtAbs[(dtAbs.length * 3 ~/ 4).clamp(0, dtAbs.length - 1)];
+    final scale = math.max(2.5, math.max(0.5 * rangeT, p75));
+    final sigma = math.max(2.5, 0.4 * rangeT);
+    final w = List<double>.generate(t.length, (i) {
+      final u = (t[i] - t0) / sigma;
+      return math.exp(-0.5 * u * u);
+    });
+    List<double> coeffs = _polyfitWeightedCentered(t, z, degree: 2, w: w, center: t0, scale: scale);
+    for (int it = 0; it < 2; it++) {
+      final res = List<double>.generate(t.length, (i) {
+        final u = (t[i] - t0) / scale;
+        return z[i] - (coeffs[0] + coeffs[1] * u + coeffs[2] * u * u);
+      });
+      final absRes = res.map((e) => e.abs()).toList()..sort();
+      final mad = absRes.isEmpty ? 1.0 : absRes[absRes.length ~/ 2];
+      final s = math.max(1e-3, 1.4826 * mad);
+      const c = 4.685;
+      for (int i = 0; i < w.length; i++) {
+        final r = res[i] / s;
+        if (r.abs() <= c) {
+          final t1 = 1.0 - (r * r) / (c * c);
+          w[i] = w[i] * t1 * t1;
+        } else {
+          w[i] = 0.0;
+        }
+      }
+      coeffs = _polyfitWeightedCentered(t, z, degree: 2, w: w, center: t0, scale: scale);
+    }
+    final slope_t2z = coeffs[1] / scale;
+    final dy_dx = fitXasFuncOfY ? 1.0 / (slope_t2z.abs() < 1e-9 ? 1e-9 : slope_t2z) : slope_t2z;
+    double tx = 1.0, ty = dy_dx;
+    final n = math.sqrt(tx * tx + ty * ty);
+    if (n < 1e-9) return [1.0, 0.0];
+    return [tx / n, ty / n];
   }
 
   static List<double> _polyfit(List<double> x, List<double> y, int degree) {
@@ -160,6 +275,47 @@ class AngleUtils {
       }
     }
     return _solveLinearSystem(ata, atb);
+  }
+
+  // Weighted quadratic (or cubic) polynomial fit in a normalized coordinate u
+  // where u = (t - center) / scale. Returns coefficients in u-basis.
+  static List<double> _polyfitWeightedCentered(
+    List<double> t,
+    List<double> z, {
+    required int degree,
+    required List<double> w,
+    required double center,
+    required double scale,
+  }) {
+    final n = t.length;
+    final m = degree + 1;
+    if (n < m) {
+      // fallback: unweighted tiny fit in original coordinates
+      return _polyfit(t, z, math.min(degree, math.max(0, n - 1)));
+    }
+    final ata = List.generate(m, (_) => List.filled(m, 0.0));
+    final atb = List.filled(m, 0.0);
+    for (int i = 0; i < n; i++) {
+      final wi = (i < w.length ? w[i] : 1.0);
+      if (wi <= 0) continue;
+      final u = (t[i] - center) / scale;
+      // Build powers of u up to degree
+      final powU = List<double>.filled(m, 0.0);
+      powU[0] = 1.0;
+      for (int k = 1; k < m; k++) powU[k] = powU[k - 1] * u;
+      for (int r = 0; r < m; r++) {
+        atb[r] += wi * z[i] * powU[r];
+        for (int c = 0; c < m; c++) {
+          ata[r][c] += wi * powU[r] * powU[c];
+        }
+      }
+    }
+    try {
+      return _solveLinearSystem(ata, atb);
+    } catch (_) {
+      // fallback to unweighted polyfit if matrix is singular
+      return _polyfit(t, z, math.min(degree, 2));
+    }
   }
 
   static List<double> _solveLinearSystem(List<List<double>> A, List<double> b) {
